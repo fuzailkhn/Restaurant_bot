@@ -6,193 +6,199 @@ import json
 import random
 import string
 import hashlib
+import re
 from datetime import datetime
 
-# ── Google Sheets setup ───────────────────────────────────────────────────────
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds_dict = json.loads(st.secrets["GOOGLE_CREDENTIALS"])
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-client_gs = gspread.authorize(creds)
-spreadsheet = client_gs.open("Savoria Reservation")
+# ── Demo mode ─────────────────────────────────────────────────────────────────
+DEMO_MODE = False  # Change to True for portfolio demo
 
-sheet = spreadsheet.sheet1  # existing reservations sheet
+DEMO_ORDERS = [
+    {"Order ID":"ORD-DEMO1","Username":"demo","Type":"Delivery","Items":"Chicken Karahi x1, Drinks x2","Total":"1800","Contact Details":"House 12, Hayatabad, 0300-1234567","Status":"Delivered","Timestamp":"2026-07-01 14:30"},
+    {"Order ID":"ORD-DEMO2","Username":"demo","Type":"Takeaway","Items":"Biryani x2","Total":"800","Contact Details":"Ahmed, 0311-9876543","Status":"Preparing","Timestamp":"2026-07-04 12:00"},
+    {"Order ID":"ORD-DEMO3","Username":"demo","Type":"Delivery","Items":"Grilled Steak x1, Pasta x1","Total":"2700","Contact Details":"Flat 5, University Road, 0333-1112233","Status":"Out for Delivery","Timestamp":"2026-07-04 13:45"},
+]
 
-try:
-    users_sheet = spreadsheet.worksheet("Users")
-except gspread.WorksheetNotFound:
-    users_sheet = spreadsheet.add_worksheet(title="Users", rows=500, cols=6)
-    users_sheet.append_row(["Username", "Password Hash", "Full Name", "Phone", "Registered At"])
+# ── Google Sheets ─────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_sheets():
+    scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+    creds_dict = json.loads(st.secrets["GOOGLE_CREDENTIALS"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    gc = gspread.authorize(creds)
+    sp = gc.open("Savoria Reservation")
+    sh1 = sp.sheet1
+    try:
+        ush = sp.worksheet("Users")
+    except gspread.WorksheetNotFound:
+        ush = sp.add_worksheet("Users", 500, 6)
+        ush.append_row(["Username","Password Hash","Full Name","Phone","Registered At"])
+    try:
+        osh = sp.worksheet("Orders")
+    except gspread.WorksheetNotFound:
+        osh = sp.add_worksheet("Orders", 1000, 8)
+        osh.append_row(["Order ID","Username","Type","Items","Total","Contact Details","Status","Timestamp"])
+    return sh1, ush, osh
 
-try:
-    orders_sheet = spreadsheet.worksheet("Orders")
-except gspread.WorksheetNotFound:
-    orders_sheet = spreadsheet.add_worksheet(title="Orders", rows=1000, cols=8)
-    orders_sheet.append_row(["Order ID", "Username", "Type", "Items", "Total", "Contact Details", "Status", "Timestamp"])
+if not DEMO_MODE:
+    sheet, users_sheet, orders_sheet = get_sheets()
 
-# ── Groq setup ────────────────────────────────────────────────────────────────
-client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def generate_order_id():
+def gen_id():
     return "ORD-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
-def hash_password(pw):
+def hash_pw(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
-def get_all_users():
-    try:
-        return users_sheet.get_all_records()
-    except Exception:
-        return []
+def get_users():
+    if DEMO_MODE:
+        return [{"Username":"demo","Password Hash":hash_pw("demo123"),"Full Name":"Demo User","Phone":"0300-0000000"}]
+    try: return users_sheet.get_all_records()
+    except: return []
 
-def find_user(username):
-    for u in get_all_users():
-        if u.get("Username", "").lower() == username.lower():
-            return u
+def find_user(uname):
+    for u in get_users():
+        if u.get("Username","").lower() == uname.lower(): return u
     return None
 
-def login_user(username, password):
-    if not username or not password:
-        return False, "Enter both fields."
-    u = find_user(username)
-    if not u:
-        return False, "User not found. Please register."
-    if u.get("Password Hash") != hash_password(password):
-        return False, "Wrong password."
+def login_user(uname, pw):
+    if not uname or not pw: return False, "Enter both fields."
+    u = find_user(uname)
+    if not u: return False, "User not found. Register first."
+    if u.get("Password Hash") != hash_pw(pw): return False, "Wrong password."
     return True, "OK"
 
-def register_user(username, password, name, phone):
-    if not username or not password:
-        return False, "Username and password required."
-    if len(username) < 3:
-        return False, "Username too short (min 3 chars)."
-    if len(password) < 6:
-        return False, "Password too short (min 6 chars)."
-    if find_user(username):
-        return False, "Username already taken."
-    users_sheet.append_row([username, hash_password(password), name, phone,
-                             datetime.now().strftime("%Y-%m-%d %H:%M")])
-    return True, "Registered successfully!"
+def register_user(uname, pw, name, phone):
+    if DEMO_MODE: return False, "Demo mode — registration disabled. Use demo/demo123."
+    if not uname or not pw: return False, "Username and password required."
+    if len(uname) < 3: return False, "Username too short (min 3)."
+    if len(pw) < 6: return False, "Password too short (min 6)."
+    if find_user(uname): return False, "Username already taken."
+    users_sheet.append_row([uname, hash_pw(pw), name, phone, datetime.now().strftime("%Y-%m-%d %H:%M")])
+    return True, "Registered!"
 
-def save_delivery_order(order_id, username, order_type, items, total, contact):
-    orders_sheet.append_row([order_id, username, order_type, items, total,
-                              contact, "Pending", datetime.now().strftime("%Y-%m-%d %H:%M")])
+def get_all_orders():
+    if DEMO_MODE: return DEMO_ORDERS
+    try: return orders_sheet.get_all_records()
+    except: return []
 
-def get_user_orders(username):
+def get_user_orders(uname):
+    return [o for o in get_all_orders() if o.get("Username","").lower() == uname.lower()]
+
+def find_order_by_id(oid):
+    for o in get_all_orders():
+        if o.get("Order ID","").upper() == oid.upper(): return o
+    return None
+
+def save_order(oid, uname, otype, items, total, contact):
+    if DEMO_MODE: return True
+    orders_sheet.append_row([oid, uname, otype, items, total, contact, "Pending", datetime.now().strftime("%Y-%m-%d %H:%M")])
+    return True
+
+def update_order_status(oid, new_status):
+    if DEMO_MODE: return True
     try:
-        return [r for r in orders_sheet.get_all_records()
-                if r.get("Username", "").lower() == username.lower()]
-    except Exception:
-        return []
+        records = orders_sheet.get_all_records()
+        for i, r in enumerate(records, start=2):
+            if r.get("Order ID","").upper() == oid.upper():
+                orders_sheet.update_cell(i, 7, new_status)
+                return True
+        return False
+    except: return False
+
+STATUS_EMOJI = {
+    "Pending":"⏳ Pending","Confirmed":"✅ Confirmed","Preparing":"👨‍🍳 Preparing",
+    "Out for Delivery":"🛵 Out for Delivery","Delivered":"✅ Delivered",
+    "Cancelled":"❌ Cancelled","Ready for Pickup":"🏃 Ready for Pickup",
+}
+def fmt_status(s): return STATUS_EMOJI.get(s, s)
+
+def detect_order_id(text):
+    m = re.search(r'ORD-[A-Z0-9]{6}', text.upper())
+    return m.group(0) if m else None
 
 # ── Translations ──────────────────────────────────────────────────────────────
 LANG = {
     "en": {
-        "title": "🍽️ Savoria Restaurant",
-        "caption": "How can we help you today?",
-        "login": "Login", "register": "Register",
-        "username": "Username", "password": "Password",
-        "full_name": "Full Name", "phone": "Phone",
-        "logout": "🚪 Logout", "my_orders": "📋 My Orders",
-        "clear": "🗑️ Clear Chat",
-        "placeholder": "Ask something...",
-        "please_login": "👈 Please login or register from the sidebar to start chatting.",
-        "welcome": "👋 Welcome to **Savoria Restaurant**! How can I help you today?",
-        "ask_contact": "📍 **Almost done!** Please share:\n- **Delivery**: full address + phone\n- **Takeaway**: your name + phone",
-        "order_confirmed": "✅ **{type} order saved!** Your Order ID: **{oid}**\nWe'll confirm shortly.",
-        "no_orders": "No delivery/takeaway orders yet.",
-        "recent_orders": "Recent Orders",
+        "title":"🍽️ Savoria Restaurant","caption":"Your AI Restaurant Assistant",
+        "login":"Login","register":"Register","username":"Username","password":"Password",
+        "full_name":"Full Name","phone":"Phone","logout":"🚪 Logout",
+        "my_orders":"📋 My Orders","track":"🔍 Track Order","clear":"🗑️ Clear Chat",
+        "placeholder":"Type a message or paste your Order ID (ORD-XXXXXX) to track...",
+        "please_login":"👈 Please login or register from the sidebar to start.",
+        "welcome":"👋 Welcome to **Savoria Restaurant**!\n\nI can help you:\n- 🍽️ Browse the menu\n- 📅 Make a dine-in reservation\n- 🛵 Place delivery or takeaway order\n- 🔍 Track your order — just type your Order ID!\n\nWhat would you like today?",
+        "ask_contact":"📍 **Almost done!** Please share:\n- **Delivery**: your full address + phone number\n- **Takeaway**: your name + phone number",
+        "order_saved":"✅ **{type} order placed!**\n\n📋 Order ID: **{oid}**\n🍱 Items: {items}\n💰 Total: Rs. {total}\n📍 Details: {contact}\n\n_Save your Order ID to track anytime!_",
+        "no_orders":"No orders yet.","recent_orders":"Recent Orders",
+        "status_not_found":"❌ Order ID not found. Please check and try again.",
+        "status_found":"📋 **Order Status**\n\n🆔 {oid}\n🛵 Type: {type}\n🍱 Items: {items}\n💰 Total: Rs. {total}\n📊 Status: **{status}**\n🕐 Placed: {time}",
+        "demo_banner":"🎭 **DEMO MODE** — Portfolio demo. Login with `demo` / `demo123`",
     },
     "ur": {
-        "title": "🍽️ سووریا ریسٹورنٹ",
-        "caption": "آج ہم آپ کی کیسے مدد کر سکتے ہیں؟",
-        "login": "لاگ ان", "register": "رجسٹر",
-        "username": "یوزر نیم", "password": "پاس ورڈ",
-        "full_name": "پورا نام", "phone": "فون نمبر",
-        "logout": "🚪 لاگ آوٹ", "my_orders": "📋 میرے آرڈرز",
-        "clear": "🗑️ چیٹ صاف کریں",
-        "placeholder": "کچھ پوچھیں...",
-        "please_login": "👈 چیٹ شروع کرنے کے لیے سائیڈبار سے لاگ ان یا رجسٹر کریں۔",
-        "welcome": "👋 **سووریا ریسٹورنٹ** میں خوش آمدید! آج میں آپ کی کیسے مدد کروں؟",
-        "ask_contact": "📍 **تقریباً ہو گیا!** براہ کرم بتائیں:\n- **ڈیلیوری**: مکمل پتہ + فون نمبر\n- **ٹیک اوے**: نام + فون نمبر",
-        "order_confirmed": "✅ **{type} آرڈر محفوظ!** آپ کی ID: **{oid}**\nہم جلد تصدیق کریں گے۔",
-        "no_orders": "ابھی کوئی ڈیلیوری/ٹیک اوے آرڈر نہیں۔",
-        "recent_orders": "حالیہ آرڈرز",
+        "title":"🍽️ سووریا ریسٹورنٹ","caption":"آپ کا AI ریسٹورنٹ اسسٹنٹ",
+        "login":"لاگ ان","register":"رجسٹر","username":"یوزر نیم","password":"پاس ورڈ",
+        "full_name":"پورا نام","phone":"فون نمبر","logout":"🚪 لاگ آوٹ",
+        "my_orders":"📋 میرے آرڈرز","track":"🔍 آرڈر ٹریک","clear":"🗑️ چیٹ صاف کریں",
+        "placeholder":"پیغام لکھیں یا آرڈر ID ڈالیں...",
+        "please_login":"👈 سائیڈبار سے لاگ ان یا رجسٹر کریں۔",
+        "welcome":"👋 **سووریا ریسٹورنٹ** میں خوش آمدید!\n\nمیں مدد کر سکتا ہوں:\n- 🍽️ مینیو دیکھنے میں\n- 📅 ریزرویشن کرنے میں\n- 🛵 آرڈر دینے میں\n- 🔍 آرڈر ٹریک کرنے میں\n\nکیسے مدد کروں؟",
+        "ask_contact":"📍 **تقریباً ہو گیا!**\n- **ڈیلیوری**: پتہ + فون\n- **ٹیک اوے**: نام + فون",
+        "order_saved":"✅ **{type} آرڈر ہو گیا!**\n\n📋 ID: **{oid}**\n🍱 {items}\n💰 روپے {total}\n📍 {contact}\n\n_ID محفوظ کریں — ٹریک کے لیے!_",
+        "no_orders":"کوئی آرڈر نہیں۔","recent_orders":"حالیہ آرڈرز",
+        "status_not_found":"❌ آرڈر ID نہیں ملی۔","status_found":"📋 **آرڈر کی حالت**\n\n🆔 {oid}\n🛵 {type}\n🍱 {items}\n💰 روپے {total}\n📊 **{status}**\n🕐 {time}",
+        "demo_banner":"🎭 **ڈیمو موڈ** — `demo` / `demo123` سے لاگ ان کریں",
     }
 }
 
-def t(key):
-    return LANG[st.session_state.get("lang", "en")].get(key, key)
+def t(key): return LANG[st.session_state.get("lang","en")].get(key, key)
 
-# ── System prompts ────────────────────────────────────────────────────────────
-SYSTEM_EN = """You are a friendly customer support assistant for Savoria Restaurant.
-
-Business Info:
-- Cuisine: Pakistani & Continental
-- Hours: 12pm to 12am, 7 days a week
-- Location: Main Boulevard, Peshawar
-- Phone: 091-1234567
+SYSTEM_EN = """You are a friendly AI assistant for Savoria Restaurant, Peshawar.
 
 Menu:
-- Karahi (Chicken/Mutton): Rs. 1500/2500
-- Biryani: Rs. 400/plate
-- Grilled Steaks: Rs. 1800
-- Pasta: Rs. 900
-- Drinks: Rs. 150
-- Desserts: Rs. 300
+- Karahi Chicken: Rs.1500 | Karahi Mutton: Rs.2500
+- Biryani: Rs.400/plate | Grilled Steak: Rs.1800 | Pasta: Rs.900
+- Drinks: Rs.150 | Desserts: Rs.300
 
-IMPORTANT RULES:
-- For DINE-IN RESERVATIONS, end your reply with EXACTLY (no extra text after):
-RESERVATION_DATA:{"name":"name","guests":"N","datetime":"date time","seating":"indoor/outdoor","order":"items","total":"Rs X","status":"Confirmed"}
+Hours: 12pm-12am | Location: Main Boulevard, Peshawar | Phone: 091-1234567
+Services: Dine-in, Takeaway, Home Delivery
 
-- For DELIVERY or TAKEAWAY orders, end reply with EXACTLY:
-ORDER_DATA:{"type":"Delivery","items":"items","total":"Rs X"}
-
-- For cancellations: CANCEL_ORDER:True
-- Never include order_id in data blocks
-- Be friendly and concise
-- Respond in English unless customer writes in Urdu"""
+RULES:
+- Dine-in reservation → end reply with: RESERVATION_DATA:{"name":"x","guests":"x","datetime":"x","seating":"indoor/outdoor","order":"x","total":"x","status":"Confirmed"}
+- Delivery/Takeaway → end reply with: ORDER_DATA:{"type":"Delivery","items":"x","total":"x"}
+- Cancellation → end reply with: CANCEL_ORDER:True
+- Be friendly, concise
+- Reply in English unless customer writes in Urdu"""
 
 SYSTEM_UR = """آپ سووریا ریسٹورنٹ کے AI اسسٹنٹ ہیں۔
-
-ریسٹورنٹ: پاکستانی و کانٹی نینٹل کھانا | اوقات: دوپہر 12 تا رات 12 | پشاور
-
-مینیو:
-- کڑاہی (چکن/مٹن): 1500/2500 روپے
-- بریانی: 400 روپے
-- گرلڈ اسٹیک: 1800 روپے
-- پاستا: 900 روپے
-- مشروبات: 150 روپے
-
-ہدایات:
-- ڈائن ان کے لیے: RESERVATION_DATA:{"name":"نام","guests":"تعداد","datetime":"وقت","seating":"indoor/outdoor","order":"اشیاء","total":"رقم","status":"Confirmed"}
-- ڈیلیوری/ٹیک اوے کے لیے: ORDER_DATA:{"type":"Delivery","items":"اشیاء","total":"رقم"}
-- منسوخی: CANCEL_ORDER:True
-- اردو میں جواب دیں"""
+مینیو: کڑاہی چکن 1500، مٹن 2500، بریانی 400، اسٹیک 1800، پاستا 900، مشروبات 150
+ڈائن ان: RESERVATION_DATA:{"name":"x","guests":"x","datetime":"x","seating":"indoor/outdoor","order":"x","total":"x","status":"Confirmed"}
+ڈیلیوری/ٹیک اوے: ORDER_DATA:{"type":"Delivery","items":"x","total":"x"}
+منسوخی: CANCEL_ORDER:True
+اردو میں جواب دیں۔"""
 
 # ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Savoria Support", page_icon="🍽️")
+st.set_page_config(page_title="Savoria Restaurant", page_icon="🍽️", layout="centered")
 
-# ── Session defaults ──────────────────────────────────────────────────────────
 for k, v in {
-    "messages": [], "current_order_id": None, "current_row": None,
-    "logged_in": False, "user": None, "lang": "en",
-    "awaiting_contact": False, "pending_order_data": None,
+    "messages":[], "current_order_id":None, "current_row":None,
+    "logged_in":False, "user":None, "lang":"en",
+    "awaiting_contact":False, "pending_order_data":None,
+    "show_orders":False, "show_track":False,
 }.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+    if k not in st.session_state: st.session_state[k] = v
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    lang_pick = st.radio("🌐 Language", ["English", "اردو"], horizontal=True)
-    st.session_state.lang = "ur" if lang_pick == "اردو" else "en"
+    lp = st.radio("🌐 Language", ["English","اردو"], horizontal=True)
+    st.session_state.lang = "ur" if lp == "اردو" else "en"
     st.divider()
 
     if not st.session_state.logged_in:
-        mode = st.radio(t("login") + " / " + t("register"), [t("login"), t("register")])
+        mode = st.radio(t("login")+" / "+t("register"), [t("login"), t("register")])
         with st.form("auth"):
             uname = st.text_input(t("username"))
-            pwd   = st.text_input(t("password"), type="password")
+            pwd = st.text_input(t("password"), type="password")
             fname = phone = ""
             if mode == t("register"):
                 fname = st.text_input(t("full_name"))
@@ -205,61 +211,88 @@ with st.sidebar:
                         st.session_state.user = uname
                         st.session_state.messages = []
                         st.rerun()
-                    else:
-                        st.error(msg)
+                    else: st.error(msg)
                 else:
                     ok, msg = register_user(uname, pwd, fname, phone)
                     (st.success if ok else st.error)(msg)
     else:
         st.markdown(f"👤 **{st.session_state.user}**")
+        st.write("")
+
         if st.button(t("my_orders"), use_container_width=True):
-            orders = get_user_orders(st.session_state.user)
-            if orders:
-                st.markdown(f"**{t('recent_orders')}:**")
-                for o in orders[-3:]:
-                    st.markdown(f"**{o.get('Order ID','')}** · {o.get('Type','')}\n🍱 {o.get('Items','')}\n💰 Rs.{o.get('Total','')} · {o.get('Status','')}\n---")
-            else:
-                st.info(t("no_orders"))
+            st.session_state.show_orders = not st.session_state.show_orders
+            st.session_state.show_track = False
+        if st.session_state.show_orders:
+            ords = get_user_orders(st.session_state.user)
+            if ords:
+                for o in ords[-5:]:
+                    st.markdown(f"**{o.get('Order ID','')}** — {fmt_status(o.get('Status',''))}\n🍱 {o.get('Items','')}\n💰 Rs.{o.get('Total','')} | 🕐 {o.get('Timestamp','')}\n---")
+            else: st.info(t("no_orders"))
+
+        if st.button(t("track"), use_container_width=True):
+            st.session_state.show_track = not st.session_state.show_track
+            st.session_state.show_orders = False
+        if st.session_state.show_track:
+            tid = st.text_input("Order ID", placeholder="ORD-XXXXXX")
+            if st.button("🔍 Check", use_container_width=True) and tid:
+                o = find_order_by_id(tid.strip())
+                if o:
+                    st.markdown(f"**{o.get('Order ID')}**\n{fmt_status(o.get('Status',''))}\n🍱 {o.get('Items','')}\n💰 Rs.{o.get('Total','')}\n📍 {o.get('Contact Details','')}\n🕐 {o.get('Timestamp','')}")
+                else: st.error(t("status_not_found"))
+
+        st.divider()
+        with st.expander("🔐 Admin Panel"):
+            apw = st.text_input("Admin Password", type="password", key="apw")
+            if apw == st.secrets.get("ADMIN_PASSWORD","savoria2024"):
+                st.success("✅ Admin Access")
+                pending = [o for o in get_all_orders() if o.get("Status") == "Pending"]
+                if pending:
+                    for o in pending:
+                        st.markdown(f"**{o.get('Order ID')}** | {o.get('Type')}\n🍱 {o.get('Items')}\n📍 {o.get('Contact Details')}")
+                        ns = st.selectbox("Status", ["Pending","Confirmed","Preparing","Out for Delivery","Ready for Pickup","Delivered","Cancelled"], key=f"s_{o.get('Order ID')}")
+                        if st.button(f"Update", key=f"u_{o.get('Order ID')}"):
+                            if update_order_status(o.get("Order ID"), ns):
+                                st.success("Updated!"); st.rerun()
+                else: st.info("No pending orders.")
+
         if st.button(t("logout"), use_container_width=True):
-            for k in ["logged_in","user","messages","current_order_id","current_row","awaiting_contact","pending_order_data"]:
-                st.session_state[k] = [] if k == "messages" else (False if k == "logged_in" else None)
+            for k in ["logged_in","user","messages","current_order_id","current_row","awaiting_contact","pending_order_data","show_orders","show_track"]:
+                st.session_state[k] = [] if k=="messages" else (False if k in ["logged_in","show_orders","show_track"] else None)
             st.rerun()
 
     st.divider()
     if st.button(t("clear"), use_container_width=True):
         for k in ["messages","current_order_id","current_row","awaiting_contact","pending_order_data"]:
-            st.session_state[k] = [] if k == "messages" else None
+            st.session_state[k] = [] if k=="messages" else None
         st.rerun()
 
-# ── Main area ─────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 st.title(t("title"))
 st.caption(t("caption"))
+if DEMO_MODE: st.info(t("demo_banner"))
 
 if not st.session_state.logged_in:
-    st.info(t("please_login"))
-    st.stop()
+    st.info(t("please_login")); st.stop()
 
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    if st.button("🍽️ Menu"):
-        st.session_state.messages.append({"role":"user","content":"Show me the menu"})
-with col2:
-    if st.button("📅 Reserve"):
-        st.session_state.messages.append({"role":"user","content":"I want to make a reservation"})
-with col3:
-    if st.button("🛵 Order"):
-        st.session_state.messages.append({"role":"user","content":"I want to order for delivery"})
-with col4:
-    if st.button("📞 Contact"):
-        st.session_state.messages.append({"role":"user","content":"How can I contact you?"})
+c1,c2,c3,c4,c5 = st.columns(5)
+with c1:
+    if st.button("🍽️ Menu"): st.session_state.messages.append({"role":"user","content":"Show me the full menu"})
+with c2:
+    if st.button("📅 Reserve"): st.session_state.messages.append({"role":"user","content":"I want to make a reservation"})
+with c3:
+    if st.button("🛵 Order"): st.session_state.messages.append({"role":"user","content":"I want to order for delivery"})
+with c4:
+    if st.button("🔍 Track"): st.session_state.messages.append({"role":"user","content":"How do I track my order?"})
+with c5:
+    if st.button("📞 Call"): st.session_state.messages.append({"role":"user","content":"What is your contact number?"})
 
 st.divider()
 
 if st.session_state.current_order_id:
-    st.info(f"📋 Active Order ID: **{st.session_state.current_order_id}**")
+    st.info(f"📋 Active Order: **{st.session_state.current_order_id}**")
 
 if not st.session_state.messages:
-    st.session_state.messages.append({"role":"assistant","content": t("welcome")})
+    st.session_state.messages.append({"role":"assistant","content":t("welcome")})
 
 for msg in st.session_state.messages:
     content = msg["content"]
@@ -267,40 +300,71 @@ for msg in st.session_state.messages:
         content = content.split("RESERVATION_DATA:")[0].split("ORDER_DATA:")[0].split("CANCEL_ORDER:")[0].strip()
     st.chat_message(msg["role"]).write(content)
 
-# ── AI + order processing ─────────────────────────────────────────────────────
+# ── Logic ─────────────────────────────────────────────────────────────────────
 if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+    last = st.session_state.messages[-1]["content"]
 
     if st.session_state.awaiting_contact and st.session_state.pending_order_data:
-        contact = st.session_state.messages[-1]["content"]
         od = st.session_state.pending_order_data
-        new_id = generate_order_id()
-        save_delivery_order(new_id, st.session_state.user,
-                            od.get("type",""), od.get("items",""),
-                            od.get("total",""), contact)
-        confirm = t("order_confirmed").format(type=od.get("type",""), oid=new_id)
-        st.chat_message("assistant").write(confirm)
-        st.session_state.messages.append({"role":"assistant","content": confirm})
-        st.success(confirm)
-        st.session_state.awaiting_contact = False
-        st.session_state.pending_order_data = None
-        st.session_state.current_order_id = new_id
+
+        # ── Validate: must contain a phone number (10-11 digits) and enough text for address ──
+        phone_found = re.search(r'(\+92|0)?[0-9]{10,11}', re.sub(r'\s','', last))
+        address_found = len(last.strip()) >= 15  # at least 15 chars = real address
+
+        if not phone_found or not address_found:
+            # Ask again with a clear example
+            if st.session_state.lang == "ur":
+                retry_msg = (
+                    "⚠️ براہ کرم اپنا **مکمل پتہ اور فون نمبر** دونوں لکھیں۔\n\n"
+                    "مثال:\n"
+                    "🏠 گھر نمبر 12، حیات آباد فیز 3، پشاور\n"
+                    "📞 0300-1234567"
+                )
+            else:
+                retry_msg = (
+                    "⚠️ Please provide both your **full address AND phone number** to complete the order.\n\n"
+                    "Example:\n"
+                    "🏠 House 12, Hayatabad Phase 3, Peshawar\n"
+                    "📞 0300-1234567"
+                )
+            st.chat_message("assistant").write(retry_msg)
+            st.session_state.messages.append({"role":"assistant","content":retry_msg})
+        else:
+            # Valid — save the order
+            new_id = gen_id()
+            save_order(new_id, st.session_state.user, od.get("type",""), od.get("items",""), od.get("total",""), last)
+            confirm = t("order_saved").format(type=od.get("type",""), oid=new_id, items=od.get("items",""), total=od.get("total",""), contact=last)
+            st.chat_message("assistant").write(confirm)
+            st.session_state.messages.append({"role":"assistant","content":confirm})
+            st.success(f"✅ Order saved! ID: **{new_id}**")
+            st.session_state.awaiting_contact = False
+            st.session_state.pending_order_data = None
+            st.session_state.current_order_id = new_id
+
+    elif detect_order_id(last):
+        oid = detect_order_id(last)
+        o = find_order_by_id(oid)
+        if o:
+            reply = t("status_found").format(oid=o.get("Order ID",""), type=o.get("Type",""), items=o.get("Items",""), total=o.get("Total",""), status=fmt_status(o.get("Status","")), time=o.get("Timestamp",""))
+        else:
+            reply = t("status_not_found")
+        st.chat_message("assistant").write(reply)
+        st.session_state.messages.append({"role":"assistant","content":reply})
 
     else:
         system = SYSTEM_UR if st.session_state.lang == "ur" else SYSTEM_EN
-        response = client.chat.completions.create(
+        response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role":"system","content":system}] + st.session_state.messages
+            messages=[{"role":"system","content":system}] + st.session_state.messages[-12:]
         )
         reply = response.choices[0].message.content
         display = reply.split("RESERVATION_DATA:")[0].split("ORDER_DATA:")[0].split("CANCEL_ORDER:")[0].strip()
         st.chat_message("assistant").write(display)
-        st.session_state.messages.append({"role":"assistant","content": reply})
+        st.session_state.messages.append({"role":"assistant","content":reply})
 
-        # Dine-in reservation (your original logic)
         if "RESERVATION_DATA:" in reply:
             try:
-                data_str = reply.split("RESERVATION_DATA:")[1].strip().split("\n")[0]
-                data = json.loads(data_str)
+                data = json.loads(reply.split("RESERVATION_DATA:")[1].strip().split("\n")[0])
                 if st.session_state.current_row:
                     row = st.session_state.current_row
                     for i, key in enumerate(["name","guests","datetime","seating","order","total"], start=1):
@@ -308,30 +372,22 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
                     sheet.update_cell(row, 7, "Confirmed")
                     st.success(f"✅ Reservation updated! ID: **{st.session_state.current_order_id}**")
                 else:
-                    new_id = generate_order_id()
+                    new_id = gen_id()
                     st.session_state.current_order_id = new_id
-                    sheet.append_row([data.get("name",""), data.get("guests",""),
-                                      data.get("datetime",""), data.get("seating",""),
-                                      data.get("order",""), data.get("total",""),
-                                      "Confirmed", new_id])
+                    sheet.append_row([data.get("name",""), data.get("guests",""), data.get("datetime",""), data.get("seating",""), data.get("order",""), data.get("total",""), "Confirmed", new_id])
                     st.session_state.current_row = len(sheet.get_all_values())
                     st.success(f"✅ Reservation saved! ID: **{new_id}**")
-            except Exception as e:
-                st.error(f"Reservation error: {e}")
+            except Exception as e: st.error(f"Reservation error: {e}")
 
-        # Delivery/Takeaway — collect contact next
         if "ORDER_DATA:" in reply:
             try:
-                data_str = reply.split("ORDER_DATA:")[1].strip().split("\n")[0]
-                st.session_state.pending_order_data = json.loads(data_str)
+                st.session_state.pending_order_data = json.loads(reply.split("ORDER_DATA:")[1].strip().split("\n")[0])
                 st.session_state.awaiting_contact = True
                 ask = t("ask_contact")
                 st.chat_message("assistant").write(ask)
-                st.session_state.messages.append({"role":"assistant","content": ask})
-            except Exception as e:
-                st.error(f"Order parse error: {e}")
+                st.session_state.messages.append({"role":"assistant","content":ask})
+            except Exception as e: st.error(f"Order error: {e}")
 
-        # Cancel (your original logic)
         if "CANCEL_ORDER:True" in reply:
             try:
                 if st.session_state.current_row:
@@ -339,11 +395,9 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
                     st.warning(f"❌ Order **{st.session_state.current_order_id}** cancelled!")
                     st.session_state.current_order_id = None
                     st.session_state.current_row = None
-                else:
-                    st.warning("No active order to cancel.")
-            except Exception as e:
-                st.error(f"Cancel error: {e}")
+                else: st.warning("No active order to cancel.")
+            except Exception as e: st.error(f"Cancel error: {e}")
 
 if prompt := st.chat_input(t("placeholder")):
-    st.session_state.messages.append({"role":"user","content": prompt})
+    st.session_state.messages.append({"role":"user","content":prompt})
     st.rerun()
